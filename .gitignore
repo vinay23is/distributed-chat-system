@@ -1,0 +1,15 @@
+# Secrets
+.env
+
+# Build artifacts
+backend/target/
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
