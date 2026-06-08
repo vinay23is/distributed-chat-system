@@ -8,6 +8,20 @@ This system solves it with Redis Pub/Sub as an event bus between backend instanc
 
 ---
 
+## Engineering Proof
+
+| Area | Implementation |
+|---|---|
+| Horizontal scaling | Two Spring Boot backend instances behind NGINX; WebSocket fan-out through Redis Pub/Sub |
+| Durable async work | Kafka persists notification events separately from real-time message delivery |
+| Auth | JWT for REST plus STOMP `CONNECT` interception for WebSocket sessions |
+| State management | Redis presence heartbeats, typing TTLs, and atomic rate-limit counters |
+| Data access | Cursor pagination on `(room_id, created_at DESC)` instead of offset scans |
+| Reliability | Soft delete for message integrity, reconnect-safe room subscriptions, Kafka deserializer error handling |
+| CI | GitHub Actions runs Maven tests and the React/TypeScript production build |
+
+---
+
 ## Architecture
 
 ```
