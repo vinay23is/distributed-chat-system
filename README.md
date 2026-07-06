@@ -1,26 +1,22 @@
 # Distributed Real-Time Chat Platform
 
-Real-time chat built to solve one specific distributed systems problem: WebSocket connections are stateful and bound to a single server. When you scale horizontally, a message sent through instance A never reaches a client connected to instance B — unless you build a cross-instance relay.
+A real-time chat system built specifically to solve one distributed-systems problem: WebSocket connections are stateful and pinned to whichever server accepted them, so scaling horizontally breaks delivery unless you build a cross-instance relay.
 
-This system solves it with Redis Pub/Sub as an event bus between backend instances.
+No hosted live demo — this is a multi-service stack (two backend instances, Postgres, Redis, Kafka, NGINX, a React frontend) meant to be run locally via Docker Compose, not deployed to a single free-tier dyno.
 
-**Stack:** Java 21 · Spring Boot 3.2 · STOMP/WebSocket · PostgreSQL 16 · Redis 7 · Apache Kafka · React 18 + TypeScript · Docker Compose
+## What problem does this solve?
 
----
+Once you run more than one instance of a WebSocket server behind a load balancer, a message sent by a client connected to instance A never reaches a client connected to instance B — there's no shared connection state between them. Most tutorials sidestep this by only ever running one instance. This project builds the actual fix: Redis Pub/Sub as an event bus between backend instances, so every instance can deliver a message to its own locally-connected clients regardless of which instance originally received it. I built this to demonstrate horizontal-scaling patterns for stateful connections, not just CRUD-over-WebSocket.
 
-## Engineering Proof
+## Tech Stack
 
-| Area | Implementation |
-|---|---|
-| Horizontal scaling | Two Spring Boot backend instances behind NGINX; WebSocket fan-out through Redis Pub/Sub |
-| Durable async work | Kafka persists notification events separately from real-time message delivery |
-| Auth | JWT for REST plus STOMP `CONNECT` interception for WebSocket sessions |
-| State management | Redis presence heartbeats, typing TTLs, and atomic rate-limit counters |
-| Data access | Cursor pagination on `(room_id, created_at DESC)` instead of offset scans |
-| Reliability | Soft delete for message integrity, reconnect-safe room subscriptions, Kafka deserializer error handling |
-| CI | GitHub Actions runs Maven tests and the React/TypeScript production build |
-
----
+- **Frontend:** React 18, TypeScript, Vite, Zustand (state), `@stomp/stompjs` + SockJS (WebSocket client), Tailwind CSS
+- **Backend:** Java 21, Spring Boot 3.2, Spring WebSocket (STOMP), Spring Security, Spring Data JPA
+- **Database:** PostgreSQL 16
+- **Cache/Messaging:** Redis 7 (Pub/Sub for cross-instance fan-out, Sets for presence, Strings with TTL for typing indicators and rate limits)
+- **Event Streaming:** Apache Kafka 3.7 (Confluent Platform 7.6) for durable notification delivery
+- **Auth:** JWT (jjwt 0.12) + BCrypt
+- **Infra/Deployment:** Docker Compose running two backend instances behind NGINX, plus Postgres, Redis, Kafka, and ZooKeeper
 
 ## Architecture
 
@@ -55,232 +51,27 @@ This system solves it with Redis Pub/Sub as an event bus between backend instanc
    └─────────────┘
 ```
 
----
+**How a message crosses instances:** User A (connected to backend-1) sends a message. `MessageService` rate-limits it (Redis `INCR`), persists it to Postgres, then publishes it to a Redis channel (`chat:room:{roomId}`). Every backend instance subscribes to `chat:*` at startup via `RedisMessageListenerContainer`, so both backend-1 and backend-2 receive the published event and each routes it to its own locally-connected STOMP clients subscribed to `/topic/room/{roomId}`. User B, connected to backend-2, gets the message with the same latency as if they'd been on the same instance as User A. In parallel, the event is also published to Kafka so offline room members get a durable notification even if Redis Pub/Sub's fire-and-forget delivery missed them.
 
-## How a message travels across instances
+## Key Features
 
-```
-User A (on backend-1) sends a message
-  │
-  ├─ ChatWebSocketController.sendMessage()
-  │     checks: room membership, mute status
-  │
-  ├─ MessageService.sendMessage()
-  │     rate-limit check  →  Redis INCR rl:msg:{userId}:{roomId}
-  │     persist           →  INSERT INTO messages, message_receipts
-  │     publish           →  redisTemplate.convertAndSend("chat:room:{roomId}", event)
-  │                                                │
-  │                                   Redis broadcasts to ALL subscribers
-  │                                                │
-  │                             ┌──────────────────┴──────────────────┐
-  │                             │                                     │
-  │                    backend-1 receives                    backend-2 receives
-  │                    RedisMessageSubscriber                RedisMessageSubscriber
-  │                    routes by eventType                   routes by eventType
-  │                    → /topic/room/{roomId}                → /topic/room/{roomId}
-  │
-  └─ Kafka (parallel)
-        publish → chat-notifications topic
-        NotificationKafkaConsumer picks it up asynchronously
-        creates Notification rows for offline room members
-```
+- Real-time messaging with typing indicators, read receipts, and presence (online/offline, per-room "currently viewing"), all built on Redis with TTL-based expiry instead of explicit cleanup events
+- Horizontal scaling proof: two backend instances behind NGINX, verifiable by watching both instances log the same Redis pub/sub event when a message is sent
+- JWT auth for REST plus a STOMP `CONNECT`-frame interceptor for WebSocket sessions, since the HTTP auth filter chain doesn't run for WebSocket handshakes
+- Cursor-based pagination for message history (`WHERE created_at < :cursor`) instead of `OFFSET`, so history load time doesn't degrade as a room's message count grows
+- Redis-backed atomic rate limiting on message sends, login attempts, and room creation
+- Soft-deleted messages (content retained for receipt/notification integrity; the delete event only carries the message ID)
+- CI (GitHub Actions) runs Maven backend tests and the React/TypeScript production build
 
-Every backend instance subscribes to `PatternTopic("chat:*")` at startup. Redis delivers a copy to each subscriber. Both instances call `messagingTemplate.convertAndSend()` on their local STOMP broker, delivering to their locally-connected clients. User B, on backend-2, gets the message with the same latency as if they were on the same instance.
+## Interesting Engineering Decisions
 
----
+- **Redis Pub/Sub for cross-instance WebSocket fan-out, Kafka for durability.** These solve different problems on purpose: Redis Pub/Sub is fire-and-forget, which is fine for real-time delivery because the message is already safely in Postgres and a reconnecting client just reloads history. Kafka's durable log is used specifically for notifications, where a user offline for 10 minutes still needs to receive them when they come back — the consumer can restart and replay from its last committed offset, which Redis Pub/Sub can't do.
+- **STOMP `CONNECT` interception instead of trying to reuse the HTTP JWT filter for WebSockets.** The WebSocket handshake completes as a plain HTTP request before any STOMP frames exist, so a `ChannelInterceptor` validates the JWT on the STOMP `CONNECT` frame instead and attaches a `Principal` that persists for the life of the session — every `@MessageMapping` handler then gets the authenticated user for free via `SimpMessageHeaderAccessor.getUser()`.
+- **A deliberate two-`useEffect` split on the frontend to avoid a subscription race.** The STOMP handshake takes 100–500ms; if a component tried to subscribe to a room in the same effect that fetches history, navigating to a room before the socket connects would silently skip the subscription. Splitting history-fetch (fires on room change) from the room subscription (fires on room change *or* connection-state change) means the subscription effect re-fires automatically once `connected` flips to `true`.
+- **Kafka partition-key-driven ordering isn't needed here, but consumer resilience is.** The notification consumer uses `ErrorHandlingDeserializer` wrapping `JsonDeserializer` with a default type fallback, so a malformed message is logged and skipped instead of crashing the whole consumer container.
+- **A known Kafka/ZooKeeper restart quirk is handled explicitly.** On container restart, Kafka can crash with `NodeExists` if its previous ephemeral broker registration in ZooKeeper hasn't expired yet. This is mitigated with a shortened `KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS` (6000ms) plus `restart: on-failure`, rather than leaving it to fail silently on `docker compose up`.
 
-## WebSocket Authentication
-
-HTTP requests go through a standard `OncePerRequestFilter` that validates the JWT from the `Authorization` header. WebSocket can't use the same filter — the HTTP handshake completes before STOMP frames begin.
-
-Instead, a `ChannelInterceptor` intercepts the STOMP `CONNECT` frame:
-
-```java
-if (StompCommand.CONNECT.equals(accessor.getCommand())) {
-    String token = accessor.getNativeHeader("Authorization").get(0);
-    if (jwtUtil.isValid(token)) {
-        String userId = jwtUtil.extractUserId(token);
-        accessor.setUser(new UsernamePasswordAuthenticationToken(...));
-    }
-}
-```
-
-The `Principal` set here persists for the lifetime of the WebSocket session. Every `@MessageMapping` handler receives the authenticated user via `SimpMessageHeaderAccessor.getUser()` — no per-frame token validation.
-
----
-
-## Redis Usage
-
-**Pub/Sub** — the cross-instance relay. `RedisMessageListenerContainer` subscribes to `chat:*` on startup. Publishing to `chat:room:{roomId}` from any instance triggers `RedisMessageSubscriber.onMessage()` on all instances, which routes to the correct STOMP topic based on `eventType`.
-
-**Presence:**
-
-| Key | Type | TTL | Purpose |
-|---|---|---|---|
-| `presence:online` | SET | — | Global set of online user IDs |
-| `presence:hb:{userId}` | STRING | 30s | Refreshed by client heartbeat every 20s |
-| `presence:room:{roomId}` | SET | — | Users currently viewing a room |
-
-If a client disconnects without a clean `DISCONNECT` (browser killed, network drop), `presence:hb:{userId}` expires in 30 seconds. `SessionDisconnectEvent` handles clean disconnects immediately.
-
-**Typing indicators:**
-
-| Key | Type | TTL |
-|---|---|---|
-| `typing:{roomId}:{userId}` | STRING | 5s |
-
-Set on `TYPING_START`, auto-expires after 5 seconds. No explicit `TYPING_STOP` cleanup is required — if the user stops typing or disconnects, the key expires on its own. No "stuck typing" indicators.
-
-**Rate limiting:**
-
-```java
-Long count = redisTemplate.opsForValue().increment(key);  // atomic INCR
-if (count == 1) redisTemplate.expire(key, window);        // set TTL on first hit
-if (count > maxRequests) throw new ResponseStatusException(429, ...);
-```
-
-| Action | Limit | Window |
-|---|---|---|
-| Sending messages | 5 | per 10 seconds per user per room |
-| Login attempts | 20 | per 15 minutes per IP |
-| Room creation | 10 | per hour per user |
-
----
-
-## Database
-
-```sql
-users         (id uuid pk, name, email unique, password_hash, avatar_url, created_at, last_seen_at)
-rooms         (id uuid pk, name, description, type, created_by → users, created_at)
-room_members  (id uuid pk, room_id → rooms, user_id → users, role, joined_at, muted_until)
-messages      (id uuid pk, room_id → rooms, sender_id → users, content text,
-               message_type, created_at, edited_at, deleted_at, pinned_at)
-message_receipts (id uuid pk, message_id → messages, user_id → users, status, updated_at)
-notifications (id uuid pk, user_id → users, room_id, message_id, type, body, is_read, created_at)
-```
-
-**Indexes on `messages`:**
-```sql
-(room_id, created_at DESC)   -- primary read path: paginated history
-(sender_id)                  -- queries by sender
-(room_id, content)           -- full-text search within a room
-```
-
-**Cursor pagination** — history is fetched with `WHERE created_at < :cursor ORDER BY created_at DESC LIMIT 50`. Initial load uses `Instant.now() + 1s` as the cursor. Loading older messages passes the oldest visible message's `created_at`. This hits the `(room_id, created_at DESC)` index at `O(log N)` regardless of history depth, unlike `OFFSET` which degrades linearly.
-
-**Soft delete** — `deleted_at` is set; content stays in the database for receipt/notification integrity. The `MESSAGE_DELETED` event carries only the `messageId`; the frontend renders a placeholder without re-fetching.
-
----
-
-## Kafka
-
-Kafka handles notification generation — a separate concern from real-time delivery.
-
-Redis Pub/Sub is fire-and-forget: if a subscriber is momentarily down, the event is lost. That's fine for real-time delivery (the message is already in PostgreSQL; the client reloads on reconnect). For notifications it isn't — a user offline for 10 minutes should still receive them. Kafka's durable log lets the consumer restart and replay from its last committed offset.
-
-The producer sets `spring.json.add.type.headers: false` (no `__TypeId__` header in messages). The consumer uses `ErrorHandlingDeserializer` wrapping `JsonDeserializer` with `spring.json.value.default.type: com.chat.platform.kafka.ChatEvent` as the fallback. A malformed message is logged and skipped; the consumer container doesn't crash.
-
----
-
-## Kafka + Zookeeper restart behavior
-
-On container restart, Kafka re-registers broker ID 1 in Zookeeper. If the previous session's ephemeral node (`/brokers/ids/1`) hasn't expired yet, Kafka crashes with `KeeperErrorCode = NodeExists`. Two mitigations are in place: `KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: 6000` shortens the ephemeral node TTL, and `restart: on-failure` in docker-compose retries after the node expires naturally.
-
----
-
-## Frontend
-
-State is managed with Zustand (`useChatStore`). The WebSocket connection lives in a React context (`WebSocketContext`) that creates a single STOMP client per login session and exposes a reactive `connected: boolean` state.
-
-**Race condition:** The STOMP handshake takes 100–500ms. If a user navigates to a room before the connection is ready, a naive implementation skips the subscription silently. The fix uses two separate effects in `ChatWindow`:
-
-```typescript
-// runs when room changes — HTTP only, no WS dependency
-useEffect(() => {
-  if (!activeRoomId) return
-  messagesApi.getHistory(activeRoomId).then(...)
-}, [activeRoomId])
-
-// runs when room OR connection state changes
-useEffect(() => {
-  if (!activeRoomId || !connected) return
-  return subscribeToRoom(activeRoomId)  // returns unsubscribe cleanup
-}, [activeRoomId, connected, subscribeToRoom])
-```
-
-When `connected` flips to `true` after the handshake, the subscription effect re-fires automatically.
-
----
-
-## WebSocket Protocol
-
-**Client → Server (`/app/...`):**
-
-| Destination | Payload |
-|---|---|
-| `/app/chat/{roomId}` | `{ content, messageType? }` |
-| `/app/typing/{roomId}` | `{ typing: boolean }` |
-| `/app/room/{roomId}/join` | `{}` |
-| `/app/room/{roomId}/leave` | `{}` |
-| `/app/read/{roomId}` | `{}` |
-| `/app/heartbeat` | `{}` |
-
-**Server → Client (subscribe):**
-
-| Destination | Content |
-|---|---|
-| `/topic/room/{roomId}` | `ChatEvent` — MESSAGE_SENT, MESSAGE_EDITED, MESSAGE_DELETED |
-| `/topic/room/{roomId}/typing` | `ChatEvent` — TYPING_START, TYPING_STOP |
-| `/topic/room/{roomId}/presence` | `{ userId, event: JOINED\|LEFT }` |
-| `/topic/room/{roomId}/receipts` | `ChatEvent` — ROOM_READ |
-| `/user/queue/notifications` | `Notification` |
-| `/user/queue/errors` | `{ error: string }` |
-
----
-
-## REST API
-
-All endpoints except `/api/auth/*` require `Authorization: Bearer <token>`.
-
-```
-# Auth
-POST /api/auth/register            { name, email, password }
-POST /api/auth/login               { email, password }
-
-# Rooms
-GET  /api/rooms                    all public rooms
-GET  /api/rooms/me                 rooms the current user belongs to
-POST /api/rooms                    create  { name, description, type }
-GET  /api/rooms/{id}               details + member list
-POST /api/rooms/{id}/join
-POST /api/rooms/{id}/leave
-DELETE /api/rooms/{id}/members/{userId}           kick (admin/owner only)
-POST   /api/rooms/{id}/members/{userId}/mute?minutes=N
-
-# Messages
-GET    /api/rooms/{id}/messages?cursor=&limit=    paginated history
-POST   /api/rooms/{id}/messages                   send { content }
-GET    /api/rooms/{id}/messages/search?q=         search within room
-PATCH  /api/rooms/{id}/messages/{msgId}           edit { content }
-DELETE /api/rooms/{id}/messages/{msgId}           soft delete
-POST   /api/rooms/{id}/messages/{msgId}/pin       toggle pin
-POST   /api/rooms/{id}/messages/read              mark room read
-
-# Users
-GET  /api/users/me
-GET  /api/users/online
-GET  /api/users/{id}/presence
-POST /api/users/me/heartbeat
-
-# Notifications
-GET  /api/notifications
-GET  /api/notifications/count
-POST /api/notifications/read-all
-```
-
----
-
-## Running locally
+## Running Locally
 
 ```bash
 git clone https://github.com/vinay23is/distributed-chat-system
@@ -289,9 +80,10 @@ cp .env.example .env         # set JWT_SECRET to any 32+ char string
 docker compose up --build
 ```
 
-Open `http://localhost:3000`. Register two users in separate browser windows — one will connect through backend-1, the other through backend-2. `docker compose logs -f backend-1 backend-2` shows both instances logging the same Redis pub/sub event when a message is sent.
+Open `http://localhost:3000`. Register two users in separate browser windows — one connects through backend-1, the other through backend-2. `docker compose logs -f backend-1 backend-2` shows both instances logging the same Redis pub/sub event when a message is sent, which is the easiest way to see the cross-instance fan-out working.
 
-**Infrastructure only (for development):**
+**Infrastructure only (for backend/frontend development):**
+
 ```bash
 docker compose up postgres redis zookeeper kafka -d
 
@@ -311,23 +103,18 @@ cd frontend && npm install && npm run dev
 |---|---|---|
 | `JWT_SECRET` | — | Required. 32+ char string |
 | `SERVER_PORT` | `8080` | Backend port |
-| `DB_HOST` | `localhost` | PostgreSQL host |
-| `DB_NAME` | `chatdb` | |
-| `DB_USER` | `chatuser` | |
-| `DB_PASS` | `chatpass` | |
+| `DB_HOST` / `DB_NAME` / `DB_USER` / `DB_PASS` | `localhost` / `chatdb` / `chatuser` / `chatpass` | PostgreSQL connection |
 | `REDIS_HOST` | `localhost` | |
 | `KAFKA_BOOTSTRAP` | `localhost:9092` | |
 
----
+## REST/WebSocket API
 
-## Tech stack
+Full endpoint reference (auth, rooms, messages, users, notifications, and the STOMP `/app`/`/topic` protocol) is documented inline in the codebase's controllers and `ChatWebSocketController`. Key REST routes:
 
-| | |
-|---|---|
-| Backend | Java 21, Spring Boot 3.2, Spring WebSocket (STOMP), Spring Security, Spring Data JPA |
-| Database | PostgreSQL 16 |
-| Cache / messaging | Redis 7 (Pub/Sub, Sets, Strings with TTL) |
-| Event streaming | Apache Kafka 3.7 (Confluent Platform 7.6) |
-| Auth | jjwt 0.12, BCrypt |
-| Frontend | React 18, TypeScript, Zustand, @stomp/stompjs, SockJS, Tailwind CSS, Vite |
-| Infrastructure | Docker Compose, NGINX |
+```
+POST /api/auth/register | /api/auth/login
+GET/POST /api/rooms, /api/rooms/me, /api/rooms/{id}
+GET/POST/PATCH/DELETE /api/rooms/{id}/messages[...]
+GET /api/users/me, /api/users/online, /api/users/{id}/presence
+GET /api/notifications, /api/notifications/count
+```
